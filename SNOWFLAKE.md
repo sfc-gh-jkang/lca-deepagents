@@ -113,6 +113,55 @@ account like `MYORG-MY_ACCOUNT_1` raises
 and `httpx` accept it. The course works because `langchain-openai` uses `httpx`;
 a plain `urllib` script against the same URL will not.
 
+**6. `model.profile` is None unless you seed it.** LangChain resolves `.profile`
+from a provider+model registry. A `ChatOpenAI` subclass on a custom `base_url`
+has no entry, so `.profile` is `None` — and the Module 3 summarization lessons do:
+
+```python
+model.profile = {**model.profile, "max_input_tokens": 700}
+```
+
+which raises `TypeError: 'NoneType' object is not a mapping` at import. `models.py`
+therefore seeds a profile from `_CORTEX_MODEL_LIMITS`, using **Snowflake's**
+documented context windows rather than Anthropic's — they disagree, e.g. Snowflake
+serves `claude-sonnet-5` at 1M context where LangChain's registry lists 200K for
+the 4-5 generation. Anything that introspects the context window depends on this.
+
+## Verification status
+
+Verified 2026-09-03 against `claude-sonnet-5` / `claude-opus-5`. **Zero
+`toolUse`/`toolResult` rejections anywhere**, including the heaviest delegation
+path in the course (`m4.3_run_manuscript.py`, 60 subagents in 2 rounds of 30).
+
+| Module | Result |
+|---|---|
+| 1 | 13/13 pass — incl. remote MCP (`docs.langchain.com`, `deepwiki`) and all three HITL interrupts |
+| 2 | 5/5 runnable pass; m2.3 needs LangSmith (see below) |
+| 3 | 6/6 pass after the profile fix above |
+| 4 | 4 pass; the 4.2 newsletter lab needs Tavily |
+| 5 | 8/8 graphs import; 5/8 invoke — remainder need a local MCP server or LangSmith |
+
+Lessons needing keys this setup deliberately omits — **none are Cortex issues**:
+
+- **LangSmith** (`LANGSMITH_API_KEY`): m2.3's three sandbox scripts construct
+  `SandboxClient()` at module top level, so they 401 against
+  `api.smith.langchain.com` before any request reaches Cortex. Also
+  `m5/sales_assistant_sandbox`.
+- **Tavily** (`TAVILY_API_KEY`): `m4_2_newsletter_agent.py` raises at import and
+  does **not** degrade gracefully; `m4.2_run_newsletter.py` inherits that. By
+  contrast `m5/sales_assistant` gates on the key and degrades cleanly.
+- **A local MCP server**: `m5/sales_assistant` expects the mock-mail MCP that its
+  `start.sh` launches on port 5002.
+
+`m5/async_lab/specialized_agent` is repointed separately: it is an isolated
+deployment (`"dependencies": ["."]`, own `pyproject.toml`), so `python/` is not on
+`sys.path` under `langgraph dev` and it cannot import `models.py`. The Cortex
+client and the tool-call fix are inlined there on purpose.
+
+Bare `*_homework.py` files are intentionally incomplete student templates and are
+not verification targets; `*_homework_filled.py` are the solutions.
+
+
 ## Models
 
 Verified callable, newest of each family:
