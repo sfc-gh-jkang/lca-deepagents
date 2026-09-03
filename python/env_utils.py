@@ -149,17 +149,26 @@ def summarize_value(key: str, value: str, example_value: str = None) -> str:
         example_value: The example/placeholder value from .env.example (optional)
 
     Returns:
-        - For *API_KEY variables: masked form (****last4) unless it matches the example value
-        - For *API_KEY variables matching example: full value (to show it needs changing)
-        - For non-API_KEY variables: full value (not obscured)
+        - For secret-bearing variables (API_KEY, PAT, TOKEN, SECRET, PASSWORD):
+          masked form (****last4) unless it matches the example value
+        - For secret-bearing variables matching example: full value (to show it needs changing)
+        - For non-secret variables: full value (not obscured)
         - For boolean strings: lowercase boolean
     """
     lower = value.lower()
     if lower in ("true", "false"):
         return lower
 
-    # Check if this is an API_KEY variable
-    is_api_key = key.endswith("API_KEY")
+    # Check if this variable carries a secret.
+    # NOTE: this deliberately matches more than just *API_KEY. SNOWFLAKE_PAT is a
+    # live credential and was printed in full when this only checked for the
+    # "API_KEY" suffix — anyone running this verifier on a shared screen or
+    # pasting its output would leak the token.
+    upper = key.upper()
+    is_api_key = any(
+        marker in upper
+        for marker in ("API_KEY", "PAT", "TOKEN", "SECRET", "PASSWORD", "CLIENT_ID")
+    )
 
     if not is_api_key:
         # Non-API_KEY variables are never obscured
