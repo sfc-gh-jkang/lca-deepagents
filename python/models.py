@@ -101,6 +101,7 @@ commented sections at the bottom of this file.
 """
 
 import json
+import logging
 import os
 from pathlib import Path
 
@@ -112,6 +113,8 @@ from langchain_core.messages import AIMessage, AIMessageChunk
 from langchain_core.messages.tool import tool_call_chunk
 from langchain_core.outputs import ChatGeneration, ChatGenerationChunk, ChatResult
 from langchain_openai import ChatOpenAI
+
+logger = logging.getLogger(__name__)
 
 
 def _keep_first_tool_call(message: AIMessage) -> AIMessage:
@@ -233,28 +236,68 @@ def _split_parallel_tool_turns(messages: list[dict]) -> list[dict]:
     return out
 
 
+_TOOL_RESULT_TRUNCATION_NOTE = (
+    "\n\n[...truncated by SnowflakeCortexChat: Cortex's Claude path returns "
+    "HTTP 500 'internal error' on large tool results. See SNOWFLAKE.md.]"
+)
+
+
+def _cap_tool_results(messages: list[dict], limit: int) -> tuple[list[dict], int]:
+    """Truncate oversized tool-role message content. Returns (messages, n_truncated).
+
+    Cortex's Claude path 500s on large tool results (gotcha 7). Truncating is
+    strictly better than the alternative, which is the whole agent run dying.
+    """
+    out, truncated = [], 0
+    for msg in messages:
+        content = msg.get("content")
+        if msg.get("role") == "tool" and isinstance(content, str) and len(content) > limit:
+            copy_ = dict(msg)
+            copy_["content"] = content[:limit] + _TOOL_RESULT_TRUNCATION_NOTE
+            out.append(copy_)
+            truncated += 1
+        else:
+            out.append(msg)
+    return out, truncated
+
+
 class SnowflakeCortexChat(ChatOpenAI):
-    """ChatOpenAI pointed at Snowflake Cortex, with the parallel tool-call fix.
+    """ChatOpenAI pointed at Snowflake Cortex, with two Claude-path workarounds.
 
-    Two independent knobs, both defaulting to the right thing:
+    Knobs, all defaulting to the right thing and all auto-disabled for openai-*
+    models, which need none of them:
 
-    * `split_parallel_tool_turns` (default True) — the good fix. Keeps genuine
-      parallel tool execution and reshapes only the outbound history. Harmless
-      on backends that don't need it, since it only fires on multi-call turns.
-    * `coerce_single_tool_call` (default False) — the blunt fallback. Discards
-      all but the first tool call so the agent works sequentially. Only needed
-      if the split ever stops being accepted.
-
-    Auto-disabled for openai-* models, which handle parallel calls natively.
+    * `split_parallel_tool_turns` (default True) — gotcha 4. Keeps genuine
+      parallel tool execution and reshapes only the outbound history.
+    * `max_tool_result_chars` (default 6000, None = off) — gotcha 7. Caps
+      tool-result content, which otherwise 500s the request.
+    * `coerce_single_tool_call` (default False) — blunt fallback for gotcha 4.
+      Discards all but the first tool call so the agent works sequentially.
     """
 
     split_parallel_tool_turns: bool = True
     coerce_single_tool_call: bool = False
+    max_tool_result_chars: int | None = 6000
 
     def _get_request_payload(self, input_, *, stop=None, **kwargs) -> dict:
         payload = super()._get_request_payload(input_, stop=stop, **kwargs)
-        if self.split_parallel_tool_turns and payload.get("messages"):
-            payload["messages"] = _split_parallel_tool_turns(payload["messages"])
+        messages = payload.get("messages")
+        if not messages:
+            return payload
+
+        if self.split_parallel_tool_turns:
+            messages = _split_parallel_tool_turns(messages)
+
+        if self.max_tool_result_chars:
+            messages, n = _cap_tool_results(messages, self.max_tool_result_chars)
+            if n:
+                logger.warning(
+                    "Truncated %d tool result(s) to %d chars to avoid the Cortex "
+                    "Claude-path HTTP 500 on large tool results.",
+                    n, self.max_tool_result_chars,
+                )
+
+        payload["messages"] = messages
         return payload
 
     def _generate(self, messages, stop=None, run_manager=None, **kwargs):
@@ -384,6 +427,9 @@ def snowflake_chat_model(model_name: str, **kwargs) -> SnowflakeCortexChat:
 
     kwargs.setdefault("split_parallel_tool_turns", not model_name.startswith("openai-"))
     kwargs.setdefault("profile", _build_profile(model_name))
+    if model_name.startswith("openai-"):
+        # openai-* takes 48KB of tool results without complaint; no cap needed.
+        kwargs.setdefault("max_tool_result_chars", None)
 
     return SnowflakeCortexChat(
         model=model_name,
@@ -394,16 +440,21 @@ def snowflake_chat_model(model_name: str, **kwargs) -> SnowflakeCortexChat:
 
 
 # ═══ Default Models (Snowflake Cortex) ═══════════════════════════════════════
+# Timeouts are deliberately higher than the upstream course values (60s / 120s).
+# Upstream paired 60s with claude-haiku-4-5; sonnet-5 and opus-5 are slower per
+# call, and the Module 4/5 research labs stuff large Tavily result sets into
+# context. At 60s, m4.2_run_newsletter.py died with openai.APITimeoutError
+# mid-delegation. Raise these rather than downgrading the model.
 # Workhorse model, used by nearly every lesson.
-model = snowflake_chat_model("claude-sonnet-5", timeout=60, max_retries=2)
+# model = snowflake_chat_model("claude-sonnet-5", timeout=180, max_retries=2)
 
 # A more capable model for steps that need stronger reasoning.
-strong_model = snowflake_chat_model("claude-opus-5", timeout=120, max_retries=2)
+strong_model = snowflake_chat_model("claude-opus-5", timeout=300, max_retries=2)
 
 # ═══ Alternative Snowflake models ════════════════════════════════════════════
 # Cheaper/faster default — swap in if the research labs in Modules 4-5 burn
 # more credits than you want. This is the newest Haiku (no haiku-5 exists).
-# model = snowflake_chat_model("claude-haiku-4-5", timeout=60, max_retries=2)
+model = snowflake_chat_model("claude-haiku-4-5", timeout=60, max_retries=2)
 #
 # model = snowflake_chat_model("claude-sonnet-4-6", timeout=60, max_retries=2)
 # strong_model = snowflake_chat_model("claude-opus-4-8", timeout=120, max_retries=2)

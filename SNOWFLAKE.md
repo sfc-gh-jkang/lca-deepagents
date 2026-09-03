@@ -127,8 +127,46 @@ documented context windows rather than Anthropic's — they disagree, e.g. Snowf
 serves `claude-sonnet-5` at 1M context where LangChain's registry lists 200K for
 the 4-5 generation. Anything that introspects the context window depends on this.
 
-## Verification status
+**7. Prompt caching only works on the `openai-*` models.** Resending an identical
+~12,300-token system prefix three times:
 
+| | `claude-sonnet-5` | `openai-gpt-5-mini` |
+|---|---|---|
+| `usage.prompt_tokens_details.cached_tokens` | `0` every call | `8,064` of 8,140 |
+| LangChain `input_token_details.cache_read` | `0` | `8,064` |
+
+Cortex does implement prompt caching and reports it correctly — Snowflake is not
+truncating the field, it is present and reaches LangSmith, it is simply zero on
+Claude. Two independent reasons Claude shows nothing: Cortex reports
+`cached_tokens = 0` for it, and Anthropic-style *explicit* caching via
+`cache_control` never fires because `langchain_anthropic`'s prompt-caching
+middleware (which deepagents loads) no-ops for a `ChatOpenAI` subclass — verified
+as zero `cache_control` occurrences across 17 captured payloads. What `openai-*`
+provides is OpenAI-style *implicit* caching, needing no markers.
+
+Also: the cache engaged on the **third** identical call, not the second as
+Module 1.4 states — calls 1 and 2 both reported `cache_read=0`. Comparing only
+two runs makes it look broken. `m1/m1.4_prompt_caching.py` pins its own models
+and shows both paths, so you never have to edit `models.py` for that exercise.
+
+Cost caveat: the token accounting is measured, but whether Cortex *bills* cached
+input at a discount is unverified — check
+`SNOWFLAKE.ACCOUNT_USAGE.CORTEX_REST_API_USAGE_HISTORY`.
+
+**8. `m4.2` (newsletter) is KNOWN BROKEN — a Cortex-side HTTP 500.** The
+subagent-team lab hits a deterministic `500 {'message': 'internal error'}` with a
+request id. Ruled out: timeout, whole-request size (an 800KB user message is
+fine), the parallel tool-call bug, `cache_control`, tool-schema shape, encoding,
+and tool-result size. It correlates with accumulated conversation growth and the
+threshold varies by model — `claude-sonnet-5` fails within ~2 minutes,
+`claude-opus-5` survives ~57 model calls over ~25 minutes and then fails the same
+way. `openai-*` clears the 500 but Azure's content filter then rejects the
+music-news results, which is not tunable. No client-side fix found; this needs
+reporting to Snowflake with the request ids. The other three Module 4 lessons
+pass, and `m4.3_run_manuscript.py` demonstrates the same subagent-team concept
+with 60 subagents, so nothing is lost pedagogically.
+
+## Verification status
 Verified 2026-09-03 against `claude-sonnet-5` / `claude-opus-5`. **Zero
 `toolUse`/`toolResult` rejections anywhere**, including the heaviest delegation
 path in the course (`m4.3_run_manuscript.py`, 60 subagents in 2 rounds of 30).
@@ -138,7 +176,7 @@ path in the course (`m4.3_run_manuscript.py`, 60 subagents in 2 rounds of 30).
 | 1 | 13/13 pass — incl. remote MCP (`docs.langchain.com`, `deepwiki`) and all three HITL interrupts |
 | 2 | 5/5 runnable pass; m2.3 needs LangSmith (see below) |
 | 3 | 6/6 pass after the profile fix above |
-| 4 | 4 pass; the 4.2 newsletter lab needs Tavily |
+| 4 | 3 pass; m4.2 newsletter KNOWN BROKEN (gotcha 8, Cortex 500) |
 | 5 | 8/8 graphs import; 5/8 invoke — remainder need a local MCP server or LangSmith |
 
 Lessons needing keys this setup deliberately omits — **none are Cortex issues**:
