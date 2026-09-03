@@ -283,6 +283,73 @@ class SnowflakeCortexChat(ChatOpenAI):
             yield chunk
 
 
+# Context and output limits as documented by SNOWFLAKE for the Cortex REST API —
+# not Anthropic's or OpenAI's own numbers, which differ. Snowflake serves
+# claude-sonnet-5 at a 1M context, whereas LangChain's registry lists 200K for
+# the 4-5 generation. Source:
+#   https://docs.snowflake.com/en/user-guide/snowflake-cortex/aisql
+# (model availability / context window table, read 2026-09-03)
+_CORTEX_MODEL_LIMITS: dict[str, tuple[int, int]] = {
+    "claude-opus-5":     (1_000_000, 128_000),
+    "claude-opus-4-8":   (1_000_000, 128_000),
+    "claude-opus-4-7":   (1_000_000, 128_000),
+    "claude-opus-4-6":   (1_000_000, 128_000),
+    "claude-sonnet-5":   (1_000_000,  64_000),
+    "claude-sonnet-4-6": (1_000_000,  64_000),
+    "claude-sonnet-4-5": (  200_000,  64_000),
+    "claude-opus-4-5":   (  200_000,  64_000),
+    "claude-haiku-4-5":  (  200_000,  64_000),
+    "openai-gpt-4.1":    (  128_000,  32_000),
+    "llama4-maverick":   (  128_000,   8_192),
+    "mistral-large2":    (  128_000,   8_192),
+}
+
+_DEFAULT_LIMITS = (200_000, 64_000)
+
+
+def _build_profile(model_name: str) -> dict:
+    """Return a LangChain-shaped model profile for a Cortex model.
+
+    Needed because `.profile` is resolved from LangChain's provider+model
+    registry, and `SnowflakeCortexChat` is a ChatOpenAI subclass pointed at a
+    custom base_url — so no registry entry exists and `.profile` would be None.
+
+    That is not cosmetic. Lessons that introspect the context window do this:
+
+        model.profile = {**model.profile, "max_input_tokens": 700}
+
+    which raises `TypeError: 'NoneType' object is not a mapping` on a None
+    profile. Module 3's summarization lessons (m3.1) fail at import without it.
+    """
+    max_in, max_out = _CORTEX_MODEL_LIMITS.get(model_name, _DEFAULT_LIMITS)
+    is_claude = model_name.startswith("claude-")
+    # llama/mistral on Cortex return "tool calling is not supported for this model"
+    supports_tools = is_claude or model_name.startswith("openai-")
+
+    return {
+        "name": f"{model_name} (Snowflake Cortex)",
+        "max_input_tokens": max_in,
+        "max_output_tokens": max_out,
+        "open_weights": not (is_claude or model_name.startswith("openai-")),
+        "text_inputs": True,
+        "image_inputs": is_claude or model_name.startswith("openai-"),
+        "audio_inputs": False,
+        "pdf_inputs": is_claude,
+        "video_inputs": False,
+        "text_outputs": True,
+        "image_outputs": False,
+        "audio_outputs": False,
+        "video_outputs": False,
+        "reasoning_output": is_claude,
+        "tool_calling": supports_tools,
+        "structured_output": supports_tools,
+        "attachment": is_claude,
+        "temperature": True,
+        "image_url_inputs": is_claude,
+        "tool_call_streaming": supports_tools,
+    }
+
+
 def _snowflake_base_url() -> str:
     """Build the Cortex OpenAI-compatible base URL from the account identifier."""
     explicit = os.environ.get("SNOWFLAKE_CORTEX_BASE_URL")
@@ -316,6 +383,7 @@ def snowflake_chat_model(model_name: str, **kwargs) -> SnowflakeCortexChat:
         )
 
     kwargs.setdefault("split_parallel_tool_turns", not model_name.startswith("openai-"))
+    kwargs.setdefault("profile", _build_profile(model_name))
 
     return SnowflakeCortexChat(
         model=model_name,

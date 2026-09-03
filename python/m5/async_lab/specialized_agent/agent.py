@@ -17,13 +17,13 @@ agent reaches this one over HTTP at http://127.0.0.1:2025, exactly like any
 other remote deployment.
 """
 
+import os
 import time
 
 import pandas as pd
-from langchain_anthropic import ChatAnthropic
-from langchain_core.tools import tool
-
 from deepagents import create_deep_agent
+from langchain_core.tools import tool
+from langchain_openai import ChatOpenAI
 
 SALES = pd.DataFrame(
     {
@@ -52,7 +52,59 @@ def analyze_sales(group_by: str = "region") -> str:
     return "\n".join(lines)
 
 
-model = ChatAnthropic(model="claude-haiku-4-5")
+class _CortexChat(ChatOpenAI):
+    """Minimal inline copy of python/models.py::SnowflakeCortexChat.
 
+    Duplicated rather than imported ON PURPOSE. This deployment declares
+    "dependencies": ["."] so python/ is NOT on sys.path at runtime — importing
+    ../../../models.py would work in a plain shell and then fail under
+    `langgraph dev`, which is the whole point of the isolation this lab teaches.
+
+    Cortex's Claude path rejects a follow-up request whose assistant turn holds
+    2+ tool calls, so split such a turn into consecutive single-call pairs. Full
+    explanation and evidence in SNOWFLAKE.md at the repo root.
+    """
+
+    def _get_request_payload(self, input_, *, stop=None, **kwargs) -> dict:
+        payload = super()._get_request_payload(input_, stop=stop, **kwargs)
+        msgs, out, i = payload.get("messages") or [], [], 0
+        while i < len(msgs):
+            m = msgs[i]
+            calls = m.get("tool_calls") if m.get("role") == "assistant" else None
+            if not calls or len(calls) <= 1:
+                out.append(m)
+                i += 1
+                continue
+            j, results = i + 1, {}
+            while j < len(msgs) and msgs[j].get("role") == "tool":
+                results[msgs[j].get("tool_call_id")] = msgs[j]
+                j += 1
+            if not results:
+                out.append(m)
+                i += 1
+                continue
+            for pos, call in enumerate(calls):
+                turn = dict(m)
+                turn["tool_calls"] = [call]
+                if pos > 0:
+                    turn["content"] = None
+                out.append(turn)
+                if (ans := results.pop(call.get("id"), None)) is not None:
+                    out.append(ans)
+            out.extend(results.values())
+            i = j
+        if out:
+            payload["messages"] = out
+        return payload
+
+
+_account = os.environ["SNOWFLAKE_ACCOUNT"]
+model = _CortexChat(
+    model="claude-haiku-4-5",
+    base_url=f"https://{_account}.snowflakecomputing.com/api/v2/cortex/v1",
+    api_key=os.environ["SNOWFLAKE_PAT"],
+    # Cortex rejects max_tokens in favour of max_completion_tokens, so leave it unset.
+    profile={"max_input_tokens": 200_000, "max_output_tokens": 64_000, "tool_calling": True},
+)
 # langgraph.json points at this module-level variable: "./agent.py:graph"
 graph = create_deep_agent(model=model, tools=[analyze_sales])
