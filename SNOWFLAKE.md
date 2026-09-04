@@ -98,7 +98,22 @@ HTTP 400  Each 'toolUse' block must be accompanied with a matching 'toolResult' 
 ```
 
 This fires even when every call *is* correctly paired, in every message shape
-tested. `parallel_tool_calls: false` is accepted (HTTP 200) and then ignored. It
+tested. The error text is misleading: the trigger is an assistant turn holding
+2+ `toolUse` blocks, **not** a pairing mistake. Result count is irrelevant —
+
+```
+1 call,  1 result   -> 200
+2 calls, 2 results  -> 400   (every call paired)
+2 calls, 1 result   -> 400   (same error)
+3 calls, 3 results  -> 400
+```
+
+so no arrangement of results can satisfy it. For contrast, the Messages API
+accepts the same fan-out with results coalesced into one `user` turn *and* split
+across two consecutive ones (both 200), so the shape Chat Completions demands is
+not a real Anthropic constraint.
+
+`parallel_tool_calls: false` is accepted (HTTP 200) and then ignored. It
 breaks `deepagents` outright, since subagent delegation goes through a `task` tool
 and the framework batches routinely.
 
@@ -180,14 +195,41 @@ Cost caveat: the token accounting is measured; whether Cortex *bills* cached inp
 at a discount is unverified — check `CORTEX_REST_API_USAGE_HISTORY`.
 
 **8. `m4.2` (newsletter) 500s on Chat Completions — FIXED by the Messages API.**
-The subagent-team lab hit a deterministic `500 {'message': 'internal error'}` on
-Chat Completions that resisted every client-side fix: not a timeout, not
-whole-request size (an 800KB user message is fine), not the parallel tool-call
-bug, not `cache_control`, not tool-schema shape, not encoding, not tool-result
-size. Different models had different thresholds (`claude-sonnet-5` failed in ~2
-minutes, `claude-opus-5` lasted ~57 calls over ~25 minutes). Switching Claude to
-the Messages API cleared it outright — the lab now completes with `EXIT=0`,
-writing the newsletter plus all four researcher archives.
+The subagent-team lab hit `500 {'message': 'internal error'}` on Chat Completions
+that resisted every client-side fix: not a timeout, not whole-request size (an
+800KB user message is fine), not the parallel tool-call bug, not `cache_control`,
+not tool-schema shape, not encoding, not tool-result size.
+
+The decisive measurement is a head-to-head. One captured 12-message research
+conversation (5 tool results, ~12.5KB of tool content, `claude-sonnet-5`), replayed
+verbatim on each surface after mechanical translation:
+
+| surface | result |
+|---|---|
+| `/v1/chat/completions` | **10/10 HTTP 500** |
+| `/v1/messages` (same conversation, same model) | **10/10 HTTP 200** |
+
+That localises the fault to the Chat Completions path, not the model, the
+conversation, or the account.
+
+Two corrections to earlier readings of this bug, both from taking single samples:
+
+- **It is not deterministic.** Repeating one payload three times gives `200/500/200`.
+  Failure is probabilistic, with the rate climbing as the conversation grows and
+  climbing again under concurrency (one payload: 5/6 sequential, 6/6 parallel).
+- **The apparent size threshold and model-dependence were noise.** Three
+  structurally identical payloads (same message count, same tool-result bytes) land
+  200/200/500, while a *larger* 16-message payload passes. Earlier claims that
+  `claude-opus-5` was more resistant, and that removing any single tool pair fixes
+  it, were single-sample artifacts and do not survive repetition.
+
+The failures are also *slow* — roughly 110s before the 500, where successes return
+in seconds. An opaque `internal error` at that latency reads as a server-side stall
+surfacing as a 500 instead of a 504 or 429, which is consistent with the
+size-and-concurrency correlation. Root cause below Snowflake's API boundary is not
+observable from a client; what is actionable is that the Messages API does not
+exhibit it. The lab now completes with `EXIT=0`, writing the newsletter plus all
+four researcher archives.
 
 ## TypeScript track
 
