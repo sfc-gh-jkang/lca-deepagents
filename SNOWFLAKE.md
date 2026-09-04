@@ -200,9 +200,40 @@ Messages API. Two differences from the Python side:
   has to be non-empty even though it is unused.
 
 Install with the pinned package manager (`corepack pnpm install`, the repo pins
-`pnpm` in `package.json`). Verified: `m1/m1.2_scratch_agent.ts` and
-`m1/m1.5_scratch_agent_tools.ts` both run against Cortex, the latter returning the
-real Chinook genre counts.
+`pnpm` in `package.json`).
+
+**Fully smoke-tested 2026-09-04: 31 of 31 runnable lessons pass, 0 fail.**
+
+| Module | Result |
+|---|---|
+| 1 | 12/12 pass (incl. remote MCP + both HITL interrupts) |
+| 2 | 5/5 runnable pass; the 3 m2.3 sandbox scripts blocked (LangSmith free plan) |
+| 3 | 6/6 pass |
+| 4 | 3/3 pass, including `m4.2_run_newsletter.ts` twice independently |
+| 5 | 4/4 graphs import AND invoke, incl. `sales_assistant` with its MCP server |
+
+Zero `cache_control` rejections, zero `max_tokens` errors, zero Cortex 4xx/5xx,
+zero auth failures, zero tsx compile errors.
+
+The `cortexFetch` top-level `cache_control` strip is **proven**, not merely
+unexercised: Modules 2-3 never load the prompt-caching middleware at all, so their
+green runs prove nothing about it — but Module 4's parallel subagent fan-out does
+load it, and passes. Note the TS track never had the Chat Completions HTTP 500 that
+broke Python's m4.2, because it went to the Messages API from the start. TS also
+wrote all four `research/<genre>/sources.md` archives on both runs, where the
+Python side drops one non-deterministically.
+
+Two operational notes, neither a defect:
+
+- **Do not run two opus-5-heavy labs concurrently.** `m5/sales_assistant` timed out
+  at 900s alongside the newsletter run (both use `strongModel`); alone it finishes
+  in under 5 minutes.
+- **`m5/sales_assistant` never exits on its own** — `MultiServerMCPClient` holds the
+  event loop open, so a bare harness returns no exit code even after a successful
+  invoke. Ctrl-C or reap it.
+
+`m1/m1.8_hitl_respond.ts` is a comment-only stub upstream, not a port gap on our
+side: its header records that langchain-JS lacks the `respond` DecisionType.
 
 ## Module 5 under `langgraph dev`
 
