@@ -190,39 +190,51 @@ the Messages API cleared it outright — the lab now completes with `EXIT=0`,
 writing the newsletter plus all four researcher archives.
 
 ## Verification status
-Verified 2026-09-03 against `claude-sonnet-5` / `claude-opus-5`. **Zero
-`toolUse`/`toolResult` rejections anywhere**, including the heaviest delegation
-path in the course (`m4.3_run_manuscript.py`, 60 subagents in 2 rounds of 30).
+
+Re-verified 2026-09-04 **on the Messages API transport** (an earlier pass on Chat
+Completions is superseded). Across 32 scripts and 14 run logs: **zero**
+`cache_control` rejections, **zero** `max_tokens` errors, **zero**
+`NoneType ... not a mapping`, **zero** Cortex 400s, **zero** Cortex 500s.
 
 | Module | Result |
 |---|---|
-| 1 | 13/13 pass — incl. remote MCP (`docs.langchain.com`, `deepwiki`) and all three HITL interrupts |
-| 2 | 5/5 runnable pass; m2.3 needs LangSmith (see below) |
-| 3 | 6/6 pass after the profile fix above |
-| 4 | 4 pass (m4.2 fixed by the Messages API — needs Tavily) |
-| 5 | 8/8 graphs import; 5/8 invoke — remainder need a local MCP server or LangSmith |
+| 1 | 12/12 pass — incl. remote MCP (`docs.langchain.com`, `deepwiki`), both HITL interrupts, and the new caching lesson |
+| 2 | 5/5 runnable pass; m2.3 blocked (see below) |
+| 3 | 6/6 pass |
+| 4 | 5/5 pass — including `m4.2_run_newsletter.py`, ~20 min |
+| 5 | 4/4 invokable pass; 2 import-only, blocked on a local MCP server / LangGraph runtime injection |
 
-Lessons needing keys this setup deliberately omits — **none are Cortex issues**:
+The caching workarounds are genuinely exercised rather than merely absent: every
+`create_deep_agent` script loads `langchain_anthropic`'s prompt-caching
+middleware, which now really fires against a real `ChatAnthropic`.
 
-- **LangSmith** (`LANGSMITH_API_KEY`): m2.3's three sandbox scripts construct
-  `SandboxClient()` at module top level, so they 401 against
-  `api.smith.langchain.com` before any request reaches Cortex. Also
-  `m5/sales_assistant_sandbox`.
-- **Tavily** (`TAVILY_API_KEY`): `m4_2_newsletter_agent.py` raises at import and
-  does **not** degrade gracefully; `m4.2_run_newsletter.py` inherits that. By
-  contrast `m5/sales_assistant` gates on the key and degrades cleanly. With a key
-  present, m4.2 passes.
-- **A local MCP server**: `m5/sales_assistant` expects the mock-mail MCP that its
+Two caveats worth knowing, neither transport-related:
+
+- **`m4.2` writes only 3 of its 4 `research/<genre>/` archives**, non-deterministically.
+  Confirmed by mtime, not by existence check: on one run Rock/Metal/Alternative were
+  fresh while `research/Latin/sources.md` was stale from an earlier run. The Latin
+  researcher does run — its segment appears in the newsletter — its raw `sources.md`
+  just does not always land in the agent `files` channel the host script mirrors from.
+  `newsletter.html` itself is complete, with all four genre sections.
+- **`m2.3` is blocked by an ORG ENTITLEMENT, not a missing key.** With
+  `LANGSMITH_API_KEY` set it returns `403 Forbidden` →
+  `SandboxAuthenticationError: Sandbox feature is not enabled for this organization`.
+  The key is accepted; rotating it will not help. Same for `m5/sales_assistant_sandbox`.
+
+Other lessons needing things this setup does not have — **none are Cortex issues**:
+
+- **A local MCP server**: `m5/sales_assistant` expects the mock-mail MCP its
   `start.sh` launches on port 5002.
+- **LangGraph server runtime**: `m5/sales_assistant_sandbox`'s `make_graph` needs
+  `config`/`runtime` injected by `langgraph dev`; it cannot be invoked in-process.
 
-`m5/async_lab/specialized_agent` is repointed separately: it is an isolated
-deployment (`"dependencies": ["."]`, own `pyproject.toml`), so `python/` is not on
-`sys.path` under `langgraph dev` and it cannot import `models.py`. The Cortex
-client and the tool-call fix are inlined there on purpose.
+`m5/async_lab/specialized_agent` is an isolated deployment (`"dependencies": ["."]`,
+own `pyproject.toml`) so `python/` is not on `sys.path` under `langgraph dev`. It
+carries a deliberate inline copy of the Messages-API client rather than importing
+`models.py`.
 
 Bare `*_homework.py` files are intentionally incomplete student templates and are
 not verification targets; `*_homework_filled.py` are the solutions.
-
 
 ## Models
 
