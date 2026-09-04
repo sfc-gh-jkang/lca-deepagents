@@ -439,28 +439,127 @@ def snowflake_chat_model(model_name: str, **kwargs) -> SnowflakeCortexChat:
     )
 
 
+def _snowflake_messages_base_url() -> str:
+    """Base URL for Cortex's Anthropic-compatible Messages API.
+
+    The Anthropic SDK appends `/v1/messages`, so this stops at `/api/v2/cortex`.
+    """
+    explicit = os.environ.get("SNOWFLAKE_CORTEX_MESSAGES_BASE_URL")
+    if explicit:
+        return explicit.rstrip("/")
+    account = os.environ.get("SNOWFLAKE_ACCOUNT")
+    if not account:
+        raise RuntimeError(
+            "Set SNOWFLAKE_ACCOUNT (e.g. MYORG-MYACCOUNT) in python/.env, or set "
+            "SNOWFLAKE_CORTEX_MESSAGES_BASE_URL to the full .../api/v2/cortex URL."
+        )
+    return f"https://{account}.snowflakecomputing.com/api/v2/cortex"
+
+
+def _make_cortex_anthropic_class():
+    """Build a ChatAnthropic subclass that strips the one field Cortex rejects.
+
+    deepagents loads langchain_anthropic's prompt-caching middleware, which — now
+    that our model really is a ChatAnthropic — actually fires and writes
+    `cache_control` into THREE places: the system blocks, each tool, and the
+    TOP LEVEL of the request body. Cortex accepts the first two and rejects the
+    third:
+
+        400 {'message': 'cache_control: Extra inputs are not permitted'}
+
+    Bisected on a captured real payload, removing one at a time:
+
+        exact LangChain payload        400
+        minus TOP-LEVEL cache_control  200   <- the only offender
+        minus tools cache_control      400
+        minus system cache_control     400
+
+    So drop only the top-level key. The system- and tool-level markers survive,
+    which is what actually earns the cache hits.
+    """
+    from langchain_anthropic import ChatAnthropic
+
+    class CortexChatAnthropic(ChatAnthropic):
+        def _get_request_payload(self, input_, *, stop=None, **kwargs) -> dict:
+            payload = super()._get_request_payload(input_, stop=stop, **kwargs)
+            payload.pop("cache_control", None)
+            return payload
+
+    return CortexChatAnthropic
+
+
+def snowflake_anthropic_model(model_name: str, **kwargs):
+    """Claude on Cortex via the ANTHROPIC MESSAGES API. Preferred for Claude.
+
+    Cortex exposes two API shapes (see the module docstring). For Claude models
+    the Messages API is strictly better than Chat Completions, measured on this
+    account 2026-09-03:
+
+      * Parallel tool calls work natively — no `_split_parallel_tool_turns`
+        workaround, because the 400 "Each 'toolUse' block must be accompanied
+        with a matching 'toolResult' block" does not occur here.
+      * Prompt caching works. `cache_control` markers are expressible in this
+        schema and Cortex honours them: a 9,604-token system block reported
+        cache_creation on call 1 and cache_read on call 2. Chat Completions has
+        nowhere to put those markers, which is the whole reason caching appeared
+        broken on Claude.
+      * `langchain_anthropic`'s prompt-caching middleware — which deepagents
+        loads and which silently no-ops for a ChatOpenAI subclass — actually
+        activates, because this really is a ChatAnthropic.
+
+    Auth note: the Anthropic SDK sends credentials as `x-api-key`, but Snowflake
+    wants a Bearer token. Passing it via `default_headers` is sufficient; the
+    `httpx` client override the Snowflake docs show is not needed. `api_key` must
+    still be set to something non-empty or the SDK refuses to construct.
+    """
+    pat = os.environ.get("SNOWFLAKE_PAT")
+    if not pat:
+        raise RuntimeError(
+            "SNOWFLAKE_PAT is not set. Add your Snowflake programmatic access "
+            "token to python/.env."
+        )
+
+    max_in, max_out = _CORTEX_MODEL_LIMITS.get(model_name, _DEFAULT_LIMITS)
+    kwargs.setdefault("max_tokens", min(max_out, 8192))
+    kwargs.setdefault("profile", _build_profile(model_name))
+
+    return _make_cortex_anthropic_class()(
+        model=model_name,
+        base_url=_snowflake_messages_base_url(),
+        api_key="unused-snowflake-uses-bearer-header",
+        default_headers={"Authorization": f"Bearer {pat}"},
+        **kwargs,
+    )
+
+
 # ═══ Default Models (Snowflake Cortex) ═══════════════════════════════════════
-# Timeouts are deliberately higher than the upstream course values (60s / 120s).
-# Upstream paired 60s with claude-haiku-4-5; sonnet-5 and opus-5 are slower per
-# call, and the Module 4/5 research labs stuff large Tavily result sets into
-# context. At 60s, m4.2_run_newsletter.py died with openai.APITimeoutError
-# mid-delegation. Raise these rather than downgrading the model.
+# Claude goes through the ANTHROPIC MESSAGES API (snowflake_anthropic_model),
+# NOT Chat Completions. On this account the Messages API gives native parallel
+# tool calls and working prompt caching, so none of the SnowflakeCortexChat
+# workarounds are needed. See snowflake_anthropic_model's docstring.
+#
+# Timeouts: upstream paired 60s with the fast haiku-4-5. sonnet-5 / opus-5 are
+# slower per call and the Module 4/5 research labs push large payloads, which
+# produced a real APITimeoutError at 60s — hence the higher values below.
+#
 # Workhorse model, used by nearly every lesson.
-# model = snowflake_chat_model("claude-sonnet-5", timeout=180, max_retries=2)
+model = snowflake_anthropic_model("claude-haiku-4-5", timeout=120, max_retries=2)
 
 # A more capable model for steps that need stronger reasoning.
-strong_model = snowflake_chat_model("claude-opus-5", timeout=300, max_retries=2)
+strong_model = snowflake_anthropic_model("claude-opus-5", timeout=300, max_retries=2)
 
 # ═══ Alternative Snowflake models ════════════════════════════════════════════
-# Cheaper/faster default — swap in if the research labs in Modules 4-5 burn
-# more credits than you want. This is the newest Haiku (no haiku-5 exists).
-model = snowflake_chat_model("claude-haiku-4-5", timeout=60, max_retries=2)
+# Latest Sonnet — a middle ground between haiku-4-5 and opus-5:
+# model = snowflake_anthropic_model("claude-sonnet-5", timeout=180, max_retries=2)
 #
-# model = snowflake_chat_model("claude-sonnet-4-6", timeout=60, max_retries=2)
-# strong_model = snowflake_chat_model("claude-opus-4-8", timeout=120, max_retries=2)
+# model = snowflake_anthropic_model("claude-sonnet-4-6", timeout=180, max_retries=2)
+# strong_model = snowflake_anthropic_model("claude-opus-4-8", timeout=300, max_retries=2)
 #
-# Non-Claude, same credential — handy for the Models lesson:
-# model = snowflake_chat_model("openai-gpt-5.4", timeout=60, max_retries=2)
+# Non-Claude, same credential — these use the OpenAI-compatible Chat Completions
+# API instead, via snowflake_chat_model. Handy for the Models lesson, and the
+# only path with implicit prompt caching:
+# model = snowflake_chat_model("openai-gpt-5-mini", timeout=180, max_retries=2)
+# strong_model = snowflake_chat_model("openai-gpt-5.4", timeout=300, max_retries=2)
 
 
 # ═════════════════════════════════════════════════════════════════════════════

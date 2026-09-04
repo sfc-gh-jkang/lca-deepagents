@@ -56,6 +56,26 @@ ALTER USER LCA_DEEPAGENTS_SVC ADD PROGRAMMATIC ACCESS TOKEN LCA_COURSE_PAT
 Search, or the AI functions. Note the REST API uses the user's **default role**,
 so it must be set. Widen `ALLOWED_IP_LIST` to taste.
 
+## Two API surfaces — pick the right one
+
+Cortex exposes the same models through two schemas, and the choice matters more
+than the model choice:
+
+| | Chat Completions `/v1/chat/completions` | Messages API `/v1/messages` |
+|---|---|---|
+| Shape | OpenAI | Anthropic |
+| Models | all | Claude only |
+| LangChain class | `ChatOpenAI` | `ChatAnthropic` |
+| Parallel tool calls on Claude | **broken** (gotcha 4) | **work natively** |
+| Prompt caching on Claude | **impossible** (gotcha 7) | **works** |
+| `m4.2` newsletter lab | **HTTP 500** | **passes** |
+
+`models.py` therefore routes **Claude through the Messages API**
+(`snowflake_anthropic_model`) and keeps Chat Completions
+(`snowflake_chat_model`) for the `openai-*` models. Three separate defects
+disappear as a result. If you only take one thing from this file: do not drive
+Claude on Cortex through Chat Completions.
+
 ## Gotchas worth knowing
 
 Measured on 2026-09-03, not taken from docs. See the `models.py` docstring for the
@@ -66,7 +86,10 @@ max_completion_tokens"* — even though Snowflake's own quickstart still shows
 `max_tokens`. `models.py` therefore never sets it; pass
 `model_kwargs={"max_completion_tokens": N}` if you need a cap.
 
-**2. Parallel tool calls break on the Claude models.** Claude-on-Cortex will emit
+**2. Parallel tool calls break on Claude — ON CHAT COMPLETIONS ONLY.** The
+Messages API handles them natively, which is why `models.py` uses it. The rest of
+this entry applies only if you deliberately drive Claude via `snowflake_chat_model`.
+ Claude-on-Cortex will emit
 an assistant turn with 2+ `tool_calls`, then reject the follow-up request carrying
 those results:
 
@@ -127,44 +150,44 @@ documented context windows rather than Anthropic's — they disagree, e.g. Snowf
 serves `claude-sonnet-5` at 1M context where LangChain's registry lists 200K for
 the 4-5 generation. Anything that introspects the context window depends on this.
 
-**7. Prompt caching only works on the `openai-*` models.** Resending an identical
-~12,300-token system prefix three times:
+**7. Prompt caching on Claude requires the Messages API.** Identical
+~12,300-token stable prefix, `cache_read` on the second call:
 
-| | `claude-sonnet-5` | `openai-gpt-5-mini` |
-|---|---|---|
-| `usage.prompt_tokens_details.cached_tokens` | `0` every call | `8,064` of 8,140 |
-| LangChain `input_token_details.cache_read` | `0` | `8,064` |
+| path | result |
+|---|---|
+| `claude-sonnet-5` via **Messages API** + `cache_control` | **14,371 of 14,455 cached** |
+| `openai-gpt-5-mini` via Chat Completions (implicit) | **8,064 of 8,140 cached** |
+| `claude-sonnet-5` via Chat Completions | `0`, always |
 
-Cortex does implement prompt caching and reports it correctly — Snowflake is not
-truncating the field, it is present and reaches LangSmith, it is simply zero on
-Claude. Two independent reasons Claude shows nothing: Cortex reports
-`cached_tokens = 0` for it, and Anthropic-style *explicit* caching via
-`cache_control` never fires because `langchain_anthropic`'s prompt-caching
-middleware (which deepagents loads) no-ops for a `ChatOpenAI` subclass — verified
-as zero `cache_control` occurrences across 17 captured payloads. What `openai-*`
-provides is OpenAI-style *implicit* caching, needing no markers.
+Snowflake is not truncating the field — it is present and reaches LangSmith, it is
+genuinely zero on that third path. The reason: OpenAI caching is *implicit* (no
+request-side expression needed) while Anthropic caching is *explicit*, requiring
+`cache_control` markers that the OpenAI Chat Completions schema has nowhere to
+put. Both working paths engage on the **second** call, exactly as Module 1.4 says.
 
-Also: the cache engaged on the **third** identical call, not the second as
-Module 1.4 states — calls 1 and 2 both reported `cache_read=0`. Comparing only
-two runs makes it look broken. `m1/m1.4_prompt_caching.py` pins its own models
-and shows both paths, so you never have to edit `models.py` for that exercise.
+Sub-gotcha: Cortex rejects a **top-level** `cache_control` on the request body
+with `400 "cache_control: Extra inputs are not permitted"`.
+`langchain_anthropic`'s prompt-caching middleware sets it there *in addition to*
+the system blocks and tools. Bisected on a real captured payload, removing the
+top-level key alone fixes it; the system- and tool-level markers are accepted and
+are what earn the hits. `models.py` strips only that key (`CortexChatAnthropic`).
 
-Cost caveat: the token accounting is measured, but whether Cortex *bills* cached
-input at a discount is unverified — check
-`SNOWFLAKE.ACCOUNT_USAGE.CORTEX_REST_API_USAGE_HISTORY`.
+Also note a minimum cacheable prefix (~1024-2048 tokens by model). A small agent
+prompt reporting 0 cached tokens is correct, not broken.
+`m1/m1.4_prompt_caching.py` demonstrates both paths without touching `models.py`.
 
-**8. `m4.2` (newsletter) is KNOWN BROKEN — a Cortex-side HTTP 500.** The
-subagent-team lab hits a deterministic `500 {'message': 'internal error'}` with a
-request id. Ruled out: timeout, whole-request size (an 800KB user message is
-fine), the parallel tool-call bug, `cache_control`, tool-schema shape, encoding,
-and tool-result size. It correlates with accumulated conversation growth and the
-threshold varies by model — `claude-sonnet-5` fails within ~2 minutes,
-`claude-opus-5` survives ~57 model calls over ~25 minutes and then fails the same
-way. `openai-*` clears the 500 but Azure's content filter then rejects the
-music-news results, which is not tunable. No client-side fix found; this needs
-reporting to Snowflake with the request ids. The other three Module 4 lessons
-pass, and `m4.3_run_manuscript.py` demonstrates the same subagent-team concept
-with 60 subagents, so nothing is lost pedagogically.
+Cost caveat: the token accounting is measured; whether Cortex *bills* cached input
+at a discount is unverified — check `CORTEX_REST_API_USAGE_HISTORY`.
+
+**8. `m4.2` (newsletter) 500s on Chat Completions — FIXED by the Messages API.**
+The subagent-team lab hit a deterministic `500 {'message': 'internal error'}` on
+Chat Completions that resisted every client-side fix: not a timeout, not
+whole-request size (an 800KB user message is fine), not the parallel tool-call
+bug, not `cache_control`, not tool-schema shape, not encoding, not tool-result
+size. Different models had different thresholds (`claude-sonnet-5` failed in ~2
+minutes, `claude-opus-5` lasted ~57 calls over ~25 minutes). Switching Claude to
+the Messages API cleared it outright — the lab now completes with `EXIT=0`,
+writing the newsletter plus all four researcher archives.
 
 ## Verification status
 Verified 2026-09-03 against `claude-sonnet-5` / `claude-opus-5`. **Zero
@@ -176,7 +199,7 @@ path in the course (`m4.3_run_manuscript.py`, 60 subagents in 2 rounds of 30).
 | 1 | 13/13 pass — incl. remote MCP (`docs.langchain.com`, `deepwiki`) and all three HITL interrupts |
 | 2 | 5/5 runnable pass; m2.3 needs LangSmith (see below) |
 | 3 | 6/6 pass after the profile fix above |
-| 4 | 3 pass; m4.2 newsletter KNOWN BROKEN (gotcha 8, Cortex 500) |
+| 4 | 4 pass (m4.2 fixed by the Messages API — needs Tavily) |
 | 5 | 8/8 graphs import; 5/8 invoke — remainder need a local MCP server or LangSmith |
 
 Lessons needing keys this setup deliberately omits — **none are Cortex issues**:
@@ -187,7 +210,8 @@ Lessons needing keys this setup deliberately omits — **none are Cortex issues*
   `m5/sales_assistant_sandbox`.
 - **Tavily** (`TAVILY_API_KEY`): `m4_2_newsletter_agent.py` raises at import and
   does **not** degrade gracefully; `m4.2_run_newsletter.py` inherits that. By
-  contrast `m5/sales_assistant` gates on the key and degrades cleanly.
+  contrast `m5/sales_assistant` gates on the key and degrades cleanly. With a key
+  present, m4.2 passes.
 - **A local MCP server**: `m5/sales_assistant` expects the mock-mail MCP that its
   `start.sh` launches on port 5002.
 

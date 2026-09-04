@@ -20,31 +20,7 @@ from deepagents import FilesystemPermission, create_deep_agent
 from langchain_core.tools import tool
 from tavily import TavilyClient
 
-from models import snowflake_chat_model
-
-# LOCAL DEVIATION (Snowflake Cortex): this lesson runs the researcher on
-# claude-opus-5 instead of the course-default workhorse model.
-#
-# The genre-researcher preserves every search result's FULL content, so tool
-# results are large and several accumulate per turn. On that payload Cortex
-# returns a deterministic HTTP 500 "internal error" — but ONLY on some models.
-# Replaying one captured failing request across the catalogue, byte-identical
-# except for the model field:
-#
-#     claude-sonnet-5     500        claude-opus-5       200
-#     claude-haiku-4-5    500        claude-sonnet-4-6   200
-#                                    claude-opus-4-8     200
-#                                    openai-gpt-5.4      200
-#
-# So it is model-specific, not a payload-shape or size problem: it is not a
-# timeout, not a whole-request size limit (an 800KB user message is fine), and
-# not the parallel-tool-call bug. openai-* also serves it, but Azure's content
-# filter then rejects music-news results outright, which is not tunable.
-# claude-opus-5 is the cheapest fix that keeps the lesson on a latest model and
-# preserves the full research content the subagent is told to keep.
-# See SNOWFLAKE.md ("Gotchas") for the evidence.
-model = snowflake_chat_model("claude-opus-5", timeout=300, max_retries=2)
-strong_model = snowflake_chat_model("claude-opus-5", timeout=300, max_retries=2)
+from models import model, strong_model
 
 # The distributor's top genres — known up front, no database needed.
 TOP_GENRES = ["Rock", "Latin", "Metal", "Alternative & Punk"]
