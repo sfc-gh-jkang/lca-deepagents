@@ -189,6 +189,42 @@ minutes, `claude-opus-5` lasted ~57 calls over ~25 minutes). Switching Claude to
 the Messages API cleared it outright — the lab now completes with `EXIT=0`,
 writing the newsletter plus all four researcher archives.
 
+## TypeScript track
+
+`typescript/models.ts` is repointed the same way, via `ChatAnthropic` against the
+Messages API. Two differences from the Python side:
+
+- The JS `ChatAnthropic` has no payload hook, so the top-level `cache_control`
+  strip happens in a custom `fetch` passed through `clientOptions`.
+- Auth goes in `clientOptions.defaultHeaders` as a Bearer token; `apiKey` still
+  has to be non-empty even though it is unused.
+
+Install with the pinned package manager (`corepack pnpm install`, the repo pins
+`pnpm` in `package.json`). Verified: `m1/m1.2_scratch_agent.ts` and
+`m1/m1.5_scratch_agent_tools.ts` both run against Cortex, the latter returning the
+real Chinook genre counts.
+
+## Module 5 under `langgraph dev`
+
+Verified end to end, browser through to Cortex:
+
+```bash
+cd python/m5/hello && ../../.venv/bin/langgraph dev --port 2024 --no-browser
+cd agent-chat-ui && corepack pnpm install && corepack pnpm dev   # localhost:3000
+```
+
+One gap in the chat UI's own config, unrelated to Snowflake: `.env.example`
+documents `NEXT_PUBLIC_API_URL` but **not** `LANGGRAPH_API_URL`, which the
+server-side passthrough at `src/app/api/[..._path]/route.ts` reads. Without it
+that route 500s with `Failed to parse URL from remove-me/...`. Set both in
+`.env.local`:
+
+```
+NEXT_PUBLIC_API_URL=http://localhost:2024
+LANGGRAPH_API_URL=http://localhost:2024
+NEXT_PUBLIC_ASSISTANT_ID=agent
+```
+
 ## Verification status
 
 Re-verified 2026-09-04 **on the Messages API transport** (an earlier pass on Chat
