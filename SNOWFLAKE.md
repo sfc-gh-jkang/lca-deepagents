@@ -244,25 +244,32 @@ The caching workarounds are genuinely exercised rather than merely absent: every
 `create_deep_agent` script loads `langchain_anthropic`'s prompt-caching
 middleware, which now really fires against a real `ChatAnthropic`.
 
-Two caveats worth knowing, neither transport-related:
+Three previously-open items, investigated 2026-09-04:
 
-- **`m4.2` writes only 3 of its 4 `research/<genre>/` archives**, non-deterministically.
-  Confirmed by mtime, not by existence check: on one run Rock/Metal/Alternative were
-  fresh while `research/Latin/sources.md` was stale from an earlier run. The Latin
-  researcher does run — its segment appears in the newsletter — its raw `sources.md`
-  just does not always land in the agent `files` channel the host script mirrors from.
-  `newsletter.html` itself is complete, with all four genre sections.
-- **`m2.3` is blocked by an ORG ENTITLEMENT, not a missing key.** With
-  `LANGSMITH_API_KEY` set it returns `403 Forbidden` →
-  `SandboxAuthenticationError: Sandbox feature is not enabled for this organization`.
-  The key is accepted; rotating it will not help. Same for `m5/sales_assistant_sandbox`.
+- **`m5/sales_assistant` — RESOLVED.** It only needed its mock mail MCP running.
+  Start it with `python mcp/mock_mail_server.py` (or `./start.sh`, which also
+  launches `langgraph dev`), then the agent invokes fine and correctly reports that
+  its Gmail work is delegated to the `inbox-manager` specialist.
 
-Other lessons needing things this setup does not have — **none are Cortex issues**:
+- **`m4.2` dropping one `research/<genre>/sources.md` — NOT A BUG, and not a
+  merge race.** The obvious hypothesis was that parallel subagents clobber each
+  other in the shared `files` channel. Disproven: a minimal repro with 4 subagents
+  writing 4 distinct paths in one parallel batch landed all 4 files, twice. The real
+  explanation is a researcher skipping step 2 of its 3-step prompt — its segment
+  reaches the newsletter (so it ran and returned) while no `sources.md` appears (so
+  it never called `write_file`). Note the researcher deliberately runs on the
+  *cheapest* model (`"model": model,  # the cheaper Haiku 4.5`), where multi-step
+  instruction-following is weakest. Treat the raw archive as best-effort;
+  `newsletter.html` itself is always complete. If you want it reliable, give the
+  researcher a stronger model — at the cost of the lesson's own cost-saving point.
 
-- **A local MCP server**: `m5/sales_assistant` expects the mock-mail MCP its
-  `start.sh` launches on port 5002.
-- **LangGraph server runtime**: `m5/sales_assistant_sandbox`'s `make_graph` needs
-  `config`/`runtime` injected by `langgraph dev`; it cannot be invoked in-process.
+- **`m2.3` / `m5/sales_assistant_sandbox` — NOT fixable by an admin toggle.**
+  `GET /v2/sandboxes/boxes` returns `403 {"error": "FeatureDisabled", "message":
+  "Sandbox feature is not enabled for this organization"}`, and
+  `GET /api/v1/orgs/current` shows the org is `Personal` on
+  `plan_tier: free_07_2026`. LangSmith sandboxes are a paid-plan feature, so this
+  needs a plan upgrade or a different org — not a permission flip, and not a new
+  key. Tracing itself works fine on the free tier.
 
 `m5/async_lab/specialized_agent` is an isolated deployment (`"dependencies": ["."]`,
 own `pyproject.toml`) so `python/` is not on `sys.path` under `langgraph dev`. It
