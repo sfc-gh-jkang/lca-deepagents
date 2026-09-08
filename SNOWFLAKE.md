@@ -175,10 +175,34 @@ the 4-5 generation. Anything that introspects the context window depends on this
 | `claude-sonnet-5` via Chat Completions | `0`, always |
 
 Snowflake is not truncating the field — it is present and reaches LangSmith, it is
-genuinely zero on that third path. The reason: OpenAI caching is *implicit* (no
-request-side expression needed) while Anthropic caching is *explicit*, requiring
-`cache_control` markers that the OpenAI Chat Completions schema has nowhere to
-put. Both working paths engage on the **second** call, exactly as Module 1.4 says.
+genuinely zero on that third path. OpenAI caching is *implicit* (no request-side
+expression needed) while Anthropic caching is *explicit*, requiring `cache_control`
+markers. Both working paths engage on the **second** call, exactly as Module 1.4 says.
+
+**Sub-gotcha — a `cache_control` shape that Chat Completions accepts but that you
+must NOT use.** A top-level `cache_control` is rejected (below), but the marker
+*is* accepted inside a message content part:
+
+```json
+{"role": "system", "content": [{"type": "text", "text": "...",
+                                "cache_control": {"type": "ephemeral"}}]}
+```
+
+That returns 200 and then reports what looks like a spectacular cache hit — on a
+**provably cold, uniquely-nonced prefix**:
+
+| system content shape | call 1 | call 2 |
+|---|---|---|
+| plain string / parts without the marker | `prompt 18,044  cached 0` | `prompt 18,044  cached 0` |
+| parts **with** the marker | `prompt 10  cached 18,032` | `prompt 10  cached 18,032` |
+
+It is not caching. A fact planted mid-prefix is still recalled verbatim on that
+first call, so the model demonstrably read all ~18K tokens while the response
+attributed 22 of them to `prompt_tokens`; latency is unchanged (3.1s vs 2.9s).
+Cortex is reporting the cache *write* as a *read*. Two consequences: this shape
+buys nothing, and **`cached_tokens` from Chat Completions cannot be trusted for
+cost analysis** — it will silently understate input tokens by orders of magnitude
+for anyone who sets the marker. Real Claude caching remains Messages-API-only.
 
 Sub-gotcha: Cortex rejects a **top-level** `cache_control` on the request body
 with `400 "cache_control: Extra inputs are not permitted"`.
@@ -230,6 +254,12 @@ size-and-concurrency correlation. Root cause below Snowflake's API boundary is n
 observable from a client; what is actionable is that the Messages API does not
 exhibit it. The lab now completes with `EXIT=0`, writing the newsletter plus all
 four researcher archives.
+
+Because the failure is intermittent rather than deterministic, a bounded retry is a
+legitimate mitigation for the Chat Completions path that survives for `openai-*`.
+No new code was needed: the `openai-*` model factories pass `max_retries=2`, and
+the OpenAI SDK already retries 5xx. Note retries are not free here — a failing call
+burns ~110s before it returns, so a retried 500 costs real wall-clock time.
 
 ## TypeScript track
 
