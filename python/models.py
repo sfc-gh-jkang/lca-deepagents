@@ -261,18 +261,60 @@ def _cap_tool_results(messages: list[dict], limit: int) -> tuple[list[dict], int
     return out, truncated
 
 
+def _strip_cache_control(messages: list[dict]) -> tuple[list[dict], int]:
+    """Remove `cache_control` markers from message content parts. Returns (messages, n).
+
+    Chat Completions *accepts* the marker inside a content part — unlike the
+    top-level key, which 400s — and then reports nearly all input tokens as
+    `cached_tokens` even on a provably cold prefix. It is not caching: content
+    marked this way is demonstrably still read in full (a fact planted mid-prefix
+    is recalled on the first call) and latency is unchanged. Cortex is reporting
+    the cache write as a read.
+
+    So the marker buys nothing here and silently corrupts usage accounting, which
+    is the dangerous part — it fails in the direction that looks like success.
+    Strip it on this path. Real Claude caching lives on the Messages API, where
+    the markers are honoured and `CortexChatAnthropic` deliberately keeps them.
+    """
+    out, stripped = [], 0
+    for msg in messages:
+        content = msg.get("content")
+        if not isinstance(content, list):
+            out.append(msg)
+            continue
+        parts, hit = [], False
+        for part in content:
+            if isinstance(part, dict) and "cache_control" in part:
+                part = {k: v for k, v in part.items() if k != "cache_control"}
+                hit = True
+            parts.append(part)
+        if hit:
+            copy_ = dict(msg)
+            copy_["content"] = parts
+            out.append(copy_)
+            stripped += 1
+        else:
+            out.append(msg)
+    return out, stripped
+
+
 class SnowflakeCortexChat(ChatOpenAI):
-    """ChatOpenAI pointed at Snowflake Cortex, with two Claude-path workarounds.
+    """ChatOpenAI pointed at Snowflake Cortex, with Claude-path workarounds.
 
     Knobs, all defaulting to the right thing and all auto-disabled for openai-*
     models, which need none of them:
 
-    * `split_parallel_tool_turns` (default True) — gotcha 4. Keeps genuine
+    * `split_parallel_tool_turns` (default True) — gotcha 2. Keeps genuine
       parallel tool execution and reshapes only the outbound history.
-    * `max_tool_result_chars` (default 6000, None = off) — gotcha 7. Caps
-      tool-result content, which otherwise 500s the request.
-    * `coerce_single_tool_call` (default False) — blunt fallback for gotcha 4.
+    * `max_tool_result_chars` (default 6000, None = off) — caps tool-result
+      content. NOTE: this was built to chase the gotcha 8 HTTP 500 and does NOT
+      fix it; the 500 is intermittent and server-side, and the real fix was
+      moving Claude to the Messages API. Kept only as a payload-size bound.
+    * `coerce_single_tool_call` (default False) — blunt fallback for gotcha 2.
       Discards all but the first tool call so the agent works sequentially.
+
+    `cache_control` markers are always stripped from content parts here — on this
+    path they do not cache and they corrupt usage reporting (gotcha 7).
     """
 
     split_parallel_tool_turns: bool = True
@@ -281,9 +323,21 @@ class SnowflakeCortexChat(ChatOpenAI):
 
     def _get_request_payload(self, input_, *, stop=None, **kwargs) -> dict:
         payload = super()._get_request_payload(input_, stop=stop, **kwargs)
+        # Top-level cache_control is a hard 400 on Cortex; the content-part form is
+        # accepted but misreports usage. Neither is wanted on this path.
+        payload.pop("cache_control", None)
         messages = payload.get("messages")
         if not messages:
             return payload
+
+        messages, n_cc = _strip_cache_control(messages)
+        if n_cc:
+            logger.warning(
+                "Stripped cache_control from %d message(s): on Cortex Chat "
+                "Completions the marker does not cache and makes usage reporting "
+                "understate input tokens. Use the Messages API for real caching.",
+                n_cc,
+            )
 
         if self.split_parallel_tool_turns:
             messages = _split_parallel_tool_turns(messages)
@@ -292,8 +346,9 @@ class SnowflakeCortexChat(ChatOpenAI):
             messages, n = _cap_tool_results(messages, self.max_tool_result_chars)
             if n:
                 logger.warning(
-                    "Truncated %d tool result(s) to %d chars to avoid the Cortex "
-                    "Claude-path HTTP 500 on large tool results.",
+                    "Truncated %d tool result(s) to %d chars as a payload-size "
+                    "bound. This does not prevent the intermittent Cortex Chat "
+                    "Completions HTTP 500 — that needs the Messages API.",
                     n, self.max_tool_result_chars,
                 )
 

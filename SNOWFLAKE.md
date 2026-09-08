@@ -204,6 +204,14 @@ buys nothing, and **`cached_tokens` from Chat Completions cannot be trusted for
 cost analysis** — it will silently understate input tokens by orders of magnitude
 for anyone who sets the marker. Real Claude caching remains Messages-API-only.
 
+`models.py` therefore strips `cache_control` from content parts on the Chat
+Completions path (`_strip_cache_control`, with a one-line warning when it fires).
+Verified: the same request that reported `input 22 / cache_read 18,057` reports
+`input 18,074 / cache_read 0` with the guard in place, and still answers the
+planted-fact question. The Messages API path deliberately keeps its markers —
+`CortexChatAnthropic` strips only the offending top-level key — and still caches
+14,371 of 14,455 tokens, so this guard does not touch real caching.
+
 Sub-gotcha: Cortex rejects a **top-level** `cache_control` on the request body
 with `400 "cache_control: Extra inputs are not permitted"`.
 `langchain_anthropic`'s prompt-caching middleware sets it there *in addition to*
@@ -260,6 +268,15 @@ legitimate mitigation for the Chat Completions path that survives for `openai-*`
 No new code was needed: the `openai-*` model factories pass `max_retries=2`, and
 the OpenAI SDK already retries 5xx. Note retries are not free here — a failing call
 burns ~110s before it returns, so a retried 500 costs real wall-clock time.
+
+The `openai-*` path also appears not to be exposed in the first place. A rebuilt
+12-message / 12.5KB-tool-content conversation of the same shape, fired six times per
+model, reproduced the 500 on `claude-sonnet-5` (1/6) and never on `openai-gpt-5-mini`
+or `openai-gpt-4.1` (0/12). That is suggestive rather than conclusive at this sample
+size, but it lines up with the `INFERENCE_REGION` split — Claude on `aws_global`
+(Bedrock/Converse), OpenAI on `azure_global` — and with the Converse-flavoured
+`toolUse` error text in gotcha 2. Best current reading: the defect belongs to the
+Claude/Converse branch of Chat Completions, not to Chat Completions as a whole.
 
 ## TypeScript track
 

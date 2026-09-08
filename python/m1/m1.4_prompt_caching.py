@@ -99,7 +99,8 @@ def report(model_name: str, via: str) -> None:
     bound = model.bind_tools([get_genre_sales])
     print(f"\n{model_name}  (via {via})")
     print(f"  {'call':<6}{'input_tokens':>14}{'cache_read':>13}{'cache_creation':>16}{'fresh':>9}")
-    cached = total = 0
+    best_cached = best_total = 0
+    hits = 0
     for i in (1, 2, 3):
         result = bound.invoke(messages)
         usage = result.usage_metadata or {}
@@ -108,9 +109,18 @@ def report(model_name: str, via: str) -> None:
         cached = details.get("cache_read") or 0
         created = details.get("cache_creation") or 0
         print(f"  {i:<6}{total:>14,}{cached:>13,}{created:>16,}{total - cached:>9,}")
+        if cached:
+            hits += 1
+            if cached > best_cached:
+                best_cached, best_total = cached, total
 
-    if cached:
-        print(f"  -> {100 * cached / total:.0f}% of input tokens read from cache on the last call")
+    # Judge on the best call, not the last one. OpenAI's *implicit* caching is
+    # nondeterministic — it will hit on call 2 and miss on call 3 for the same
+    # prefix — so reading only the final call reports "nothing cached" on a run
+    # that plainly cached. Anthropic's explicit caching is steady by comparison.
+    if best_cached:
+        print(f"  -> {100 * best_cached / best_total:.0f}% of input tokens read from "
+              f"cache at best ({hits} of 3 calls hit the cache)")
     else:
         print("  -> nothing cached (see the gotchas in this file's docstring)")
 
@@ -125,8 +135,13 @@ if __name__ == "__main__":
     report("openai-gpt-5-mini", via="chat")
 
     print(
-        "\nBoth paths show the effect the lesson describes, and both engage on the\n"
-        "SECOND call exactly as it says. The difference is how you ask: Claude needs\n"
-        "explicit cache_control markers on the Messages API, OpenAI needs nothing at\n"
-        "all. The same numbers appear in the LangSmith `usage` field."
+        "\nBoth paths show the effect the lesson describes. The difference is how you\n"
+        "ask: Claude needs explicit cache_control markers on the Messages API, OpenAI\n"
+        "needs nothing at all. The same numbers appear in the LangSmith `usage` field.\n"
+        "\n"
+        "On a COLD prefix, caching engages on the second call, exactly as the lesson\n"
+        "says — call 1 writes the cache, call 2 reads it. If you see call 1 already\n"
+        "hitting, the cache is simply still warm from an earlier run; edit SYSTEM_PROMPT\n"
+        "to see the cold behaviour again. Anthropic's explicit caching is steady across\n"
+        "calls; OpenAI's implicit caching is not guaranteed on any given call."
     )
