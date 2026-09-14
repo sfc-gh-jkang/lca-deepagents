@@ -147,9 +147,22 @@ auto-disable for `openai-*`). `llama4-maverick` and `mistral-large2` return
 
 **5. Underscored account identifiers fail Python's TLS hostname check.** An
 account like `MYORG-MY_ACCOUNT_1` raises
-`CERTIFICATE_VERIFY_FAILED: Hostname mismatch` under `urllib`/`ssl`, while `curl`
-and `httpx` accept it. The course works because `langchain-openai` uses `httpx`;
-a plain `urllib` script against the same URL will not.
+`CERTIFICATE_VERIFY_FAILED: Hostname mismatch`. `curl` accepts it; **plain `httpx`
+does not** — verified 2026-09-14 with httpx 0.28.1, both on the default trust store
+and with `verify=certifi.where()`. The fix is to spell the host with hyphens, which
+is Snowflake's documented URL form and verifies cleanly:
+
+```
+SFSENORTHAMERICA-JKANG_AWS_US_EAST_1_1   -> CERTIFICATE_VERIFY_FAILED
+SFSENORTHAMERICA-JKANG-AWS-US-EAST-1-1   -> HTTP 200
+```
+
+The lessons work against the underscored spelling anyway because the OpenAI and
+Anthropic SDK client stacks tolerate it, which is why this went unnoticed —
+`models.py` passes `SNOWFLAKE_ACCOUNT` through verbatim. Any script that calls the
+REST API directly should normalize (`account.replace("_", "-")`), as
+`probe_cortex_defects.py` does. An earlier version of this file claimed httpx
+accepted the underscored form; that was wrong.
 
 **6. `model.profile` is None unless you seed it.** LangChain resolves `.profile`
 from a provider+model registry. A `ChatOpenAI` subclass on a custom `base_url`
@@ -277,6 +290,26 @@ size, but it lines up with the `INFERENCE_REGION` split — Claude on `aws_globa
 (Bedrock/Converse), OpenAI on `azure_global` — and with the Converse-flavoured
 `toolUse` error text in gotcha 2. Best current reading: the defect belongs to the
 Claude/Converse branch of Chat Completions, not to Chat Completions as a whole.
+
+## Are these defects still there?
+
+`python/probe_cortex_defects.py` answers that without re-reading this file. It
+exercises all three defects and the three paths that avoid them, compares each
+result against the behaviour recorded here, and exits non-zero only on drift:
+
+```
+uv run python probe_cortex_defects.py            # all six checks, ~3 min
+uv run python probe_cortex_defects.py --quick    # skip the slow 500-rate sampling
+```
+
+Exit codes: `0` no drift, `1` drift, `2` inconclusive (requests never reached
+Snowflake — a dead network or an expired PAT, which is deliberately *not* reported
+as drift). The `chat_500` check accepts both `defect_present` and `no_failures`,
+because that defect is probabilistic and a clean run proves nothing; only the
+deterministic checks pin to a single status.
+
+Drift matters in both directions. A defect disappearing means `models.py` can be
+simplified; a workaround breaking means the course is broken.
 
 ## TypeScript track
 
