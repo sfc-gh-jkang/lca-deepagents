@@ -35,13 +35,27 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-ACCOUNT = os.environ.get("SNOWFLAKE_ACCOUNT", "")
-PAT = os.environ.get("SNOWFLAKE_PAT", "")
-# Underscores are legal in an account identifier but not in a hostname.
-HOST = ACCOUNT.replace("_", "-")
-BASE = f"https://{HOST}.snowflakecomputing.com/api/v2/cortex/v1"
-CHAT, MESSAGES = f"{BASE}/chat/completions", f"{BASE}/messages"
+ACCOUNT = ""
+PAT = ""
+BASE = CHAT = MESSAGES = ""
 MODEL = "claude-sonnet-5"
+
+
+def _load_config(env_file: str | None = None) -> None:
+    """Resolve account/PAT/URLs. Called by both the CLI and importing callers.
+
+    Config is resolved here rather than at import time so a caller in another
+    working directory (the Prefect flow) can point at this project's .env.
+    """
+    global ACCOUNT, PAT, BASE, CHAT, MESSAGES
+    if env_file:
+        load_dotenv(env_file, override=True)
+    ACCOUNT = os.environ.get("SNOWFLAKE_ACCOUNT", "")
+    PAT = os.environ.get("SNOWFLAKE_PAT", "")
+    # Underscores are legal in an account identifier but not in a hostname.
+    host = ACCOUNT.replace("_", "-")
+    BASE = f"https://{host}.snowflakecomputing.com/api/v2/cortex/v1"
+    CHAT, MESSAGES = f"{BASE}/chat/completions", f"{BASE}/messages"
 
 # Behaviour measured on 2026-09-14. See SNOWFLAKE.md gotchas 2, 7, 8.
 # Each value is the set of statuses that are NOT drift. The deterministic checks
@@ -316,60 +330,103 @@ def check_500_rates(samples: int) -> tuple[tuple[str, str], tuple[str, str]]:
     return chat, msg
 
 
-# --------------------------------------------------------------------------- run
+# --------------------------------------------------------------------------- api
 
-def main() -> int:
-    ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("--quick", action="store_true", help="skip the slow 500-rate check")
-    ap.add_argument("--samples", type=int, default=6, help="calls per surface for the 500 check")
-    args = ap.parse_args()
+def run_probe(samples: int = 6, quick: bool = False,
+              env_file: str | None = None) -> dict:
+    """Run every check and return a structured verdict. The importable entry point.
 
+    Returns keys: `verdict` (no_drift | drift | inconclusive), `results`
+    (check -> {status, detail, accepted}), `drift` (list), `transport_errors`,
+    `account`, `model`, `exit_code`.
+    """
+    TRANSPORT_ERRORS.clear()
+    _load_config(env_file)
     if not ACCOUNT or not PAT:
-        print("SNOWFLAKE_ACCOUNT and SNOWFLAKE_PAT must be set (see .env.example).")
-        return 2
+        return {"verdict": "inconclusive", "results": {}, "drift": [],
+                "transport_errors": ["SNOWFLAKE_ACCOUNT / SNOWFLAKE_PAT not set"],
+                "account": ACCOUNT, "model": MODEL, "exit_code": 2}
 
-    print(f"Probing Cortex defects on {ACCOUNT}, model={MODEL}\n")
     results: dict[str, tuple[str, str]] = {
         "chat_parallel_tool_calls": check_chat_parallel_tool_calls(),
         "messages_parallel_tool_calls": check_messages_parallel_tool_calls(),
         "chat_cache_control_usage": check_chat_cache_control_usage(),
         "messages_caching": check_messages_caching(),
     }
-    if args.quick:
-        print("(--quick: skipping the 500-rate check)\n")
-    else:
-        chat_500, msg_500 = check_500_rates(args.samples)
+    if not quick:
+        chat_500, msg_500 = check_500_rates(samples)
         results["chat_500"] = chat_500
         results["messages_500"] = msg_500
 
+    drift = [{"check": n, "accepted": list(BASELINE.get(n, ())), "observed": s}
+             for n, (s, _) in results.items() if s not in BASELINE.get(n, ())]
+
+    if TRANSPORT_ERRORS:
+        verdict, code = "inconclusive", 2
+    elif drift:
+        verdict, code = "drift", 1
+    else:
+        verdict, code = "no_drift", 0
+
+    return {
+        "verdict": verdict,
+        "results": {n: {"status": s, "detail": d, "accepted": list(BASELINE.get(n, ()))}
+                    for n, (s, d) in results.items()},
+        "drift": drift,
+        "transport_errors": list(dict.fromkeys(TRANSPORT_ERRORS)),
+        "account": ACCOUNT,
+        "model": MODEL,
+        "exit_code": code,
+    }
+
+
+# --------------------------------------------------------------------------- run
+
+def main() -> int:
+    ap = argparse.ArgumentParser(description=__doc__)
+    ap.add_argument("--quick", action="store_true", help="skip the slow 500-rate check")
+    ap.add_argument("--samples", type=int, default=6, help="calls per surface for the 500 check")
+    ap.add_argument("--env-file", default=None, help="path to a .env (default: nearest)")
+    args = ap.parse_args()
+
+    _load_config(args.env_file)
+    if not ACCOUNT or not PAT:
+        print("SNOWFLAKE_ACCOUNT and SNOWFLAKE_PAT must be set (see .env.example).")
+        return 2
+
+    print(f"Probing Cortex defects on {ACCOUNT}, model={MODEL}\n")
+    if args.quick:
+        print("(--quick: skipping the 500-rate check)\n")
+    report = run_probe(samples=args.samples, quick=args.quick, env_file=args.env_file)
+
     print(f"{'check':32}{'accepted':30}{'observed':15}detail")
-    drift = []
-    for name, (status, detail) in results.items():
-        accepted = BASELINE.get(name, ())
-        ok = status in accepted
+    for name, row in report["results"].items():
+        ok = row["status"] in row["accepted"]
         flag = "" if ok else "   <-- DRIFT"
-        if not ok:
-            drift.append((name, "|".join(accepted), status))
-        print(f"{name:32}{'|'.join(accepted):30}{status:15}{detail}{flag}")
+        print(f"{name:32}{'|'.join(row['accepted']):30}{row['status']:15}"
+              f"{row['detail']}{flag}")
 
     print()
     # Distinguish "the network was down" from "the defects changed". Reporting drift
     # off unreachable requests would be a false alarm every time the VPN drops.
-    if TRANSPORT_ERRORS:
-        print(f"INCONCLUSIVE — {len(TRANSPORT_ERRORS)} request(s) never reached Snowflake.")
-        for err in dict.fromkeys(TRANSPORT_ERRORS[:3]):
+    if report["verdict"] == "inconclusive":
+        print(f"INCONCLUSIVE — {len(report['transport_errors'])} distinct transport "
+              "error(s); requests never reached Snowflake.")
+        for err in report["transport_errors"][:3]:
             print(f"  {err}")
         print("\nNo verdict on any defect. Check the network, the account identifier, and\n"
               "that SNOWFLAKE_PAT is unexpired, then re-run.")
         return 2
 
-    if not drift:
+    if report["verdict"] == "no_drift":
         skipped = " (500-rate check skipped)" if args.quick else ""
         print(f"No drift — every defect and every workaround behaves as recorded{skipped}.")
         return 0
+
     print("DRIFT DETECTED:")
-    for name, expected, got in drift:
-        print(f"  {name}: expected {expected}, observed {got}")
+    for row in report["drift"]:
+        print(f"  {row['check']}: expected {'|'.join(row['accepted'])}, "
+              f"observed {row['observed']}")
     print("\nA fixed defect means models.py can be simplified; a broken workaround means\n"
           "the course is broken. Either way, re-read SNOWFLAKE.md and update the baseline.")
     return 1
