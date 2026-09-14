@@ -31,7 +31,15 @@ import uuid
 from concurrent.futures import ThreadPoolExecutor
 
 import httpx
-from dotenv import load_dotenv
+
+try:
+    from dotenv import load_dotenv
+except ModuleNotFoundError:  # pragma: no cover
+    # The probe runs in two places: this course's uv env (dotenv present, reads
+    # python/.env) and a bare Prefect worker that only has httpx, where config
+    # arrives as real environment variables. Degrade instead of failing to import.
+    def load_dotenv(*_args, **_kwargs) -> bool:  # type: ignore[misc]
+        return False
 
 load_dotenv()
 
