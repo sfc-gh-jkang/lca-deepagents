@@ -86,6 +86,12 @@ TIMEOUT = httpx.Timeout(240.0)
 # transport failures separately so a flat network can never read as a verdict.
 TRANSPORT_ERRORS: list[str] = []
 
+# Nor does a rejected credential. An expired PAT 401s every call, which would make
+# every check report an unexpected status and the run conclude DRIFT — an alarming
+# "the defects changed" verdict when the true answer is "rotate the PAT". Tracked
+# separately for the same reason as transport errors.
+AUTH_ERRORS: list[str] = []
+
 
 def _post(url: str, body: dict, anthropic: bool = False) -> tuple[int, dict]:
     """POST and return (status_code, json). status_code 0 means it never got there."""
@@ -94,6 +100,9 @@ def _post(url: str, body: dict, anthropic: bool = False) -> tuple[int, dict]:
         headers["anthropic-version"] = "2023-06-01"
     try:
         r = httpx.post(url, json=body, headers=headers, timeout=TIMEOUT)
+        if r.status_code in (401, 403):
+            AUTH_ERRORS.append(f"HTTP {r.status_code} from {url.rsplit('/', 1)[-1]}: "
+                               f"{r.text[:100]}")
         try:
             return r.status_code, r.json()
         except ValueError:
@@ -346,13 +355,18 @@ def run_probe(samples: int = 6, quick: bool = False,
 
     Returns keys: `verdict` (no_drift | drift | inconclusive), `results`
     (check -> {status, detail, accepted}), `drift` (list), `transport_errors`,
-    `account`, `model`, `exit_code`.
+    `auth_errors`, `reason` (why it was inconclusive, or None), `account`, `model`,
+    `exit_code`.
     """
     TRANSPORT_ERRORS.clear()
+    AUTH_ERRORS.clear()
     _load_config(env_file)
     if not ACCOUNT or not PAT:
+        missing = " and ".join(n for n, v in (("SNOWFLAKE_ACCOUNT", ACCOUNT),
+                                              ("SNOWFLAKE_PAT", PAT)) if not v)
         return {"verdict": "inconclusive", "results": {}, "drift": [],
-                "transport_errors": ["SNOWFLAKE_ACCOUNT / SNOWFLAKE_PAT not set"],
+                "transport_errors": [], "auth_errors": [f"{missing} not set"],
+                "reason": "credentials_missing",
                 "account": ACCOUNT, "model": MODEL, "exit_code": 2}
 
     results: dict[str, tuple[str, str]] = {
@@ -369,19 +383,25 @@ def run_probe(samples: int = 6, quick: bool = False,
     drift = [{"check": n, "accepted": list(BASELINE.get(n, ())), "observed": s}
              for n, (s, _) in results.items() if s not in BASELINE.get(n, ())]
 
-    if TRANSPORT_ERRORS:
-        verdict, code = "inconclusive", 2
+    # Order matters: a rejected credential or a dead network makes every comparison
+    # meaningless, so neither may be reported as drift.
+    if AUTH_ERRORS:
+        verdict, code, reason = "inconclusive", 2, "auth_rejected"
+    elif TRANSPORT_ERRORS:
+        verdict, code, reason = "inconclusive", 2, "transport_unreachable"
     elif drift:
-        verdict, code = "drift", 1
+        verdict, code, reason = "drift", 1, None
     else:
-        verdict, code = "no_drift", 0
+        verdict, code, reason = "no_drift", 0, None
 
     return {
         "verdict": verdict,
         "results": {n: {"status": s, "detail": d, "accepted": list(BASELINE.get(n, ()))}
                     for n, (s, d) in results.items()},
-        "drift": drift,
+        "drift": drift if verdict == "drift" else [],
         "transport_errors": list(dict.fromkeys(TRANSPORT_ERRORS)),
+        "auth_errors": list(dict.fromkeys(AUTH_ERRORS)),
+        "reason": reason,
         "account": ACCOUNT,
         "model": MODEL,
         "exit_code": code,
@@ -415,15 +435,31 @@ def main() -> int:
               f"{row['detail']}{flag}")
 
     print()
-    # Distinguish "the network was down" from "the defects changed". Reporting drift
-    # off unreachable requests would be a false alarm every time the VPN drops.
+    # A rejected credential or a dead network invalidates every comparison, so
+    # neither is reported as drift — the actionable message is different.
     if report["verdict"] == "inconclusive":
-        print(f"INCONCLUSIVE — {len(report['transport_errors'])} distinct transport "
-              "error(s); requests never reached Snowflake.")
-        for err in report["transport_errors"][:3]:
-            print(f"  {err}")
-        print("\nNo verdict on any defect. Check the network, the account identifier, and\n"
-              "that SNOWFLAKE_PAT is unexpired, then re-run.")
+        if report["reason"] == "auth_rejected":
+            print("INCONCLUSIVE — Snowflake rejected the credential, so no verdict "
+                  "on any defect.")
+            for err in report["auth_errors"][:3]:
+                print(f"  {err}")
+            print("\nThe PAT is expired, revoked, or role-restricted. Rotate it and "
+                  "update EVERY store that holds it:\n"
+                  "  1. python/.env                    (SNOWFLAKE_PAT)\n"
+                  "  2. cortex secret lca_deepagents_pat  (delete, then store — "
+                  "store does not overwrite)\n"
+                  "  3. Prefect Secret block lca-cortex-pat  (used by the scheduled run)")
+        elif report["reason"] == "credentials_missing":
+            print("INCONCLUSIVE — credentials not set.")
+            for err in report["auth_errors"]:
+                print(f"  {err}")
+        else:
+            print(f"INCONCLUSIVE — {len(report['transport_errors'])} distinct transport "
+                  "error(s); requests never reached Snowflake.")
+            for err in report["transport_errors"][:3]:
+                print(f"  {err}")
+            print("\nNo verdict on any defect. Check the network and the account "
+                  "identifier, then re-run.")
         return 2
 
     if report["verdict"] == "no_drift":
