@@ -48,9 +48,19 @@ GRANT ROLE LCA_DEEPAGENTS_RL TO USER LCA_DEEPAGENTS_SVC;
 CREATE NETWORK POLICY LCA_DEEPAGENTS_NP ALLOWED_IP_LIST = ('0.0.0.0/0');
 ALTER USER LCA_DEEPAGENTS_SVC SET NETWORK_POLICY = LCA_DEEPAGENTS_NP;
 
-ALTER USER LCA_DEEPAGENTS_SVC ADD PROGRAMMATIC ACCESS TOKEN LCA_COURSE_PAT
-  ROLE_RESTRICTION = 'LCA_DEEPAGENTS_RL' DAYS_TO_EXPIRY = 90;
+ALTER USER LCA_DEEPAGENTS_SVC ADD PROGRAMMATIC ACCESS TOKEN LCA_COURSE_PAT_2027
+  ROLE_RESTRICTION = 'LCA_DEEPAGENTS_RL' DAYS_TO_EXPIRY = 365;
 ```
+
+`DAYS_TO_EXPIRY = 365` rather than 90. The original 90-day token (`LCA_COURSE_PAT`,
+created 2026-09-03) was rotated out on 2026-09-23 and removed; a 90-day credential on
+a course repo means a silent 401 a quarter later, long after anyone remembers why.
+Expiry on the demo account is watched monthly by the alert
+`FULLSTACK_DB.DEVOPS.PAT_EXPIRY_ALERT`, which reads
+`SNOWFLAKE.ACCOUNT_USAGE.CREDENTIALS` — that view is account-wide, whereas
+`SHOW USER PROGRAMMATIC ACCESS TOKENS` takes one user at a time and so cannot see a
+service-user token like this one unless you already know to ask for
+`LCA_DEEPAGENTS_SVC`.
 
 `SNOWFLAKE.CORTEX_REST_API_USER` grants the REST API only — not Cortex Analyst,
 Search, or the AI functions. Note the REST API uses the user's **default role**,
